@@ -138,29 +138,36 @@ def calculate_sha256(file_path):
 
 def scan_single_file(file_path, db):
     try:
+        fname_lower = os.path.basename(file_path).lower()
+        if re.search(r"\.(pdf|docx?|xlsx?|pptx?|jpg|jpeg|png|mp4|txt|zip)\.(exe|scr|bat|cmd|vbs|ps1|js|hta|pif)$", fname_lower):
+            reason = "Double-Extension Masquerading Attack"
+            q_name = quarantine_file(file_path, "ZeroDay-Heuristic", reason)
+            return f"[ALERT - MASQUERADE] {file_path} ({reason}) -> {q_name}"
         file_hash = calculate_sha256(file_path)
         if file_hash in db["hashes"]:
             threat = db["hashes"][file_hash]
             q_name = quarantine_file(file_path, "Signature", threat)
             return f"[ALERT - SIGNATURE] {file_path} ({threat}) -> {q_name}"
-
         with open(file_path, "rb") as f:
-            content = f.read()
-
-        for rule_name, pattern_str in db["heuristics"].items():
+            content = f.read(1024 * 1024)
+        all_rules = {
+            "Suspicious Downloader (certutil/bitsadmin)": r"(certutil\s+-urlcache|bitsadmin\s+transfer|Invoke-WebRequest.*-OutFile)",
+            "Registry Persistence Tampering": r"CurrentVersion\\Run",
+            "Scheduled Task Persistence": r"schtasks\s+/create",
+            "Windows Defender Tampering": r"(Set-MpPreference\s+-DisableRealtimeMonitoring|sc\s+stop\s+WinDefend)",
+        }
+        all_rules.update(db.get("heuristics", {}))
+        for rule_name, pattern_str in all_rules.items():
             if re.search(pattern_str.encode("utf-8"), content, re.IGNORECASE):
                 q_name = quarantine_file(file_path, "Heuristic", rule_name)
                 return f"[ALERT - HEURISTIC] {file_path} ({rule_name}) -> {q_name}"
-
-        # Step 3: Entropy Check (flags packed/encrypted executables & scripts)
-        risky_exts = (".exe", ".dll", ".bat", ".ps1", ".vbs", ".scr", ".cmd")
-        if file_path.lower().endswith(risky_exts):
+        risky_exts = (".exe", ".dll", ".bat", ".ps1", ".vbs", ".scr", ".cmd", ".hta")
+        if fname_lower.endswith(risky_exts) and not any(k  in fname_lower for k in ("setup", "install", "update", "python")):
             entropy = calculate_entropy(file_path)
-            if entropy >= 7.5:
-                reason = f"High Entropy / Packed ({entropy}/8.0)"
-                q_name = quarantine_file(file_path, "Entropy", reason)
-                return f"[ALERT - ENTROPY] {file_path} ({reason}) -> {q_name}"
-
+            if entropy >= 7.45:
+                reason = f"High Entropy / Packed Payload ({entropy}/8.0)"
+                q_name = quarantine_file(file_path, "ZeroDay-Entropy", reason)
+                return f"[ALERT - ENTROPY]{file_path} ({reason}) -> {q_name}"
     except (PermissionError, FileNotFoundError, OSError):
         pass
     return None
@@ -217,39 +224,69 @@ class AntivirusGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Python Antivirus Guard - Created by Dr. Alireza Kamali Dehkordi")
-        self.root.geometry("860x520")
+        self.root.geometry("1020x640")
 
         
+        self.root.configure(bg="#0f172a")
+        hdr = tk.Frame(root, bg="#1e293b", pady=8)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text="PYTHON ANTIVIRUS GUARD  //  CYBER-SOC CONSOLE v2.5", bg="#1e293b", fg="#38bdf8", font=("Consolas", 12, "bold")).pack(side=tk.LEFT, padx=14)
+        tk.Label(hdr, text="Dr. Alireza Kamali Dehkordi", bg="#1e293b", fg="#94a3b8", font=("Consolas", 9)).pack(side=tk.RIGHT, padx=14)
+        self.scanned_count = 0
+        self.threat_count = 0
+        stats = tk.Frame(root, bg="#0f172a", pady=6)
+        stats.pack(fill=tk.X, padx=10)
+        self.stat_scanned = tk.StringVar(value="FILES SCANNED: 0")
+        self.stat_threats = tk.StringVar(value="THREATS BLOCKED: 0")
+        self.stat_vault = tk.StringVar(value=f"QUARANTINE VAULT: {len(load_manifest())}")
+        tk.Label(stats, textvariable=self.stat_scanned, bg="#1e293b", fg="#38bdf8", font=("Consolas", 10, "bold"), padx=14, pady=5).pack(side=tk.LEFT, padx=5)
+        tk.Label(stats, textvariable=self.stat_threats, bg="#1e293b", fg="#f87171", font=("Consolas", 10, "bold"), padx=14, pady=5).pack(side=tk.LEFT, padx=5)
+        tk.Label(stats, textvariable=self.stat_vault, bg="#1e293b", fg="#fbbf24", font=("Consolas", 10, "bold"), padx=14, pady=5).pack(side=tk.LEFT, padx=5)
         self.monitoring = False
         self.db = load_signatures()
-
-        btn_frame = tk.Frame(root, pady=10)
-        btn_frame.pack(fill=tk.X, padx=10)
-
-        tk.Button(btn_frame, text="Scan Folder", width=15, command=self.start_scan).pack(side=tk.LEFT, padx=5)
-        self.monitor_btn = tk.Button(btn_frame, text="Start Monitor", width=15, command=self.toggle_monitor)
+        row1 = tk.Frame(root, bg="#0f172a", pady=4)
+        row1.pack(fill=tk.X, padx=10, pady=(4, 2))
+        row2 = tk.Frame(root, bg="#0f172a", pady=4)
+        row2.pack(fill=tk.X, padx=10, pady=(2, 6))
+        btn_cfg = {"bg": "#1e293b", "fg": "#e2e8f0", "activebackground": "#334155", "activeforeground": "white", "relief": "flat", "font": ("Segoe UI", 9, "bold")}
+        self.shield_active = False
+        self.shield_btn = tk.Button(row1, text="Downloads+USB: OFF", width=18, command=self.toggle_auto_shield, **btn_cfg)
+        self.shield_btn.pack(side=tk.LEFT, padx=5)
+        tk.Button(row1, text="Scan Folder", width=16, command=self.start_scan, **btn_cfg).pack(side=tk.LEFT, padx=5)
+        self.monitor_btn = tk.Button(row1, text="Start Monitor", width=16, command=self.toggle_monitor, **btn_cfg)
         self.monitor_btn.pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Quarantine Vault", width=15, command=self.open_quarantine_window).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Reload Signatures", width=15, command=self.reload_db).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Create Test Threat", width=15, command=self.create_test_file).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Startup Audit", width=15, command=self.run_startup_audit).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Check Updates", width=15, command=self.auto_update_db).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Network / IP Guard", width=17, command=self.open_network_guard).pack(side=tk.LEFT, padx=5)
-
-        self.status_var = tk.StringVar(value="Status: Ready | Signatures loaded.")
-        tk.Label(root, textvariable=self.status_var, anchor="w", fg="blue").pack(fill=tk.X, padx=12)
-
-        self.console = scrolledtext.ScrolledText(root, wrap=tk.WORD, height=22, font=("Consolas", 10))
-        self.console.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        tk.Button(row1, text="Quarantine Vault", width=16, command=self.open_quarantine_window, **btn_cfg).pack(side=tk.LEFT, padx=5)
+        tk.Button(row1, text="Create Test Threat", width=16, command=self.create_test_file, **btn_cfg).pack(side=tk.LEFT, padx=5)
+        tk.Button(row2, text="Network / IP Guard", width=18, command=self.open_network_guard, **btn_cfg).pack(side=tk.LEFT, padx=5)
+        tk.Button(row2, text="Process Watchdog", width=16, command=self.open_process_watchdog, **btn_cfg).pack(side=tk.LEFT, padx=5)
+        tk.Button(row2, text="Startup Audit", width=16, command=self.run_startup_audit, **btn_cfg).pack(side=tk.LEFT, padx=5)
+        tk.Button(row2, text="Reload Signatures", width=16, command=self.reload_db, **btn_cfg).pack(side=tk.LEFT, padx=5)
+        tk.Button(row2, text="Check Updates", width=16, command=self.auto_update_db, **btn_cfg).pack(side=tk.LEFT, padx=5)
+        self.status_var = tk.StringVar(value="Status: SOC Online | Zero-Day & Heuristic Engines Active.")
+        tk.Label(root, textvariable=self.status_var, anchor="w", bg="#0f172a", fg="#38bdf8", font=("Consolas", 9)).pack(fill=tk.X, padx=14)
+        self.console = scrolledtext.ScrolledText(root, wrap=tk.WORD, height=22, font=("Consolas", 10), bg="#0b1120", fg="#e2e8f0", insertbackground="white", relief="flat")
+        self.console.pack(fill=tk.BOTH, expand=True, padx=12, pady=10)
+        self.console.tag_config("alert", foreground="#f87171")
+        self.console.tag_config("ok", foreground="#4ade80")
+        self.console.tag_config("info", foreground="#38bdf8")
+        self.console.tag_config("warn", foreground="#fbbf24")
         self.log_ui("System initialized. External database: signatures.json")
-        self.log_ui("Python Antivirus Guard v1.0 | Created by Dr. Alireza Kamali Dehkordi")
+        self.log_ui("Python Antivirus Guard v2.5 | Created by Dr. Alireza Kamali Dehkordi")
         self.auto_update_db()
         self.log_ui("System initialized. External database: signatures.json")
 
     def log_ui(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.console.insert(tk.END, f"[{timestamp}] {message}\n")
+        tag = "alert" if "[ALERT" in message else ("ok" if ("Clean:" in message or "Active!" in message or "RESTORED" in message) else "warn" if any(k in message for k in (chr(91)+"STARTUP"+chr(93), chr(91)+"WATCHDOG"+chr(93), chr(91)+"STOPPED"+chr(93))) else "info")
+        self.console.insert(tk.END, f"[{timestamp}] {message}\n", tag)
         self.console.see(tk.END)
+        if "[ALERT" in message:
+            self.threat_count += 1
+            self.stat_threats.set(f"THREATS BLOCKED: {self.threat_count}")
+            self.stat_vault.set(f"QUARANTINT VAULT: {len(load_manifest())}")
+        if ("Clean:" in message or "[ALERT" in message):
+            self.scanned_count += 1
+            self.stat_scanned.set(f"FILES SCANNED: {self.scanned_count}")
 
     def reload_db(self):
         self.db = load_signatures()
@@ -460,6 +497,49 @@ class AntivirusGUI:
         tk.Button(top, text="Block IP (Firewall)", fg="white", bg="#b71c1c", command=block_ip).pack(side=tk.LEFT, padx=4)
         scan_connections()
 
+
+
+    def toggle_auto_shield(self):
+        if self.shield_active:
+            self.shield_active = False
+            self.shield_btn.config(text="Downloads+USB: OFF", bg="SystemButtonFace", fg="black")
+            self.log_ui("[SHIELD] Automatic Downloads & USB Drive Shield stopped.")
+            return
+        self.shield_active = True
+        self.shield_btn.config(text="Downloads+USB: ON", bg="#1b5e20", fg="white")
+        downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        self.log_ui(f"[SHIELD] Active! Protecting Downloads ({downloads_dir}) + Auto-Scanning USB Drives.")
+        def _shield_worker():
+            seen_files = {os.path.join(downloads_dir, f) for f in os.listdir(downloads_dir)} if os.path.isdir(downloads_dir) else set()
+            known_drives = {f"{l}:\\" for l in "DEFGHIJKLMNOPQRSTUVWXYZ" if os.path.exists(f"{l}:\\")}
+            while self.shield_active:
+                try:
+                    if os.path.isdir(downloads_dir):
+                        for fname in os.listdir(downloads_dir):
+                            fpath = os.path.join(downloads_dir, fname)
+                            if fpath not in seen_files and os.path.isfile(fpath):
+                                seen_files.add(fpath)
+                                time.sleep(0.6)
+                                alert = scan_single_file(fpath, self.db)
+                                self.log_ui(f"[DOWNLOAD-SHIELD] {alert}" if alert else f"[DOWNLOAD-SHIELD] Clean: {fname}")
+                    current_drives = {f"{l}:\\" for l in "DEFGHIJKLMNOPQRSTUVWXYZ" if os.path.exists(f"{l}:\\")}
+                    for drv in (current_drives - known_drives):
+                        self.log_ui(f"[USB-SHIELD] New drive detected ({drv}) - scanning...")
+                        threading.Thread(target=self._run_scan_thread, args=(drv,), daemon=True).start()
+                    known_drives = current_drives
+                except Exception:
+                    pass
+                time.sleep(2)
+        threading.Thread(target=_shield_worker, daemon=True).start()
+
+    def open_process_watchdog(self):
+        win = tk.Toplevel(self.root)
+        win.title("Process Watchdog")
+        win.geometry("860x500")
+        out = scrolledtext.ScrolledText(win, wrap=tk.WORD, font=("Consolas", 9))
+        out.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        raw = subprocess.check_output("tasklist", shell=True, text=True, errors="ignore")
+        out.insert(tk.END, raw)
 
 if __name__ == "__main__":
     app_root = tk.Tk()
